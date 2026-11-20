@@ -65,7 +65,7 @@ impl Manifest {
             }
         };
         let class_attr = |el: &Element, id: u32, name: &str| -> Option<String> {
-            el.attr(id, name).and_then(Value::as_str).map(&qualify)
+            el.attr(id, name).and_then(Value::as_str).map(qualify)
         };
         let as_ref = |v: &Value| match v {
             Value::Ref(id) => Some(*id),

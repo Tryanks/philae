@@ -1,0 +1,4 @@
+# The toolchain the packer is built and linted with, so that CI and local builds agree.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
