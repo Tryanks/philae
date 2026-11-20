@@ -9,7 +9,7 @@ jobs:
   packer:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo fmt --check
       - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
@@ -18,7 +18,7 @@ jobs:
   scripts:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: brew install shellcheck
       - run: shellcheck scripts/*.sh scripts/dev/*.sh tests/*/run.sh
       - name: Python syntax
