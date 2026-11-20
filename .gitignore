@@ -1,0 +1,10 @@
+# Everything below is downloaded or built by scripts/build-all.sh.
+/target/
+/out/
+/third_party/
+# Local APKs to test with.
+/testdata/
+
+__pycache__/
+*.pyc
+.DS_Store

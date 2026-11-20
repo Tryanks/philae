@@ -1,0 +1,28 @@
+diff --git a/core/jni/android_util_AssetManager.cpp b/core/jni/android_util_AssetManager.cpp
+index 3d0ab4ef..d8527298 100644
+--- a/core/jni/android_util_AssetManager.cpp
++++ b/core/jni/android_util_AssetManager.cpp
+@@ -244,7 +244,7 @@ static jstring NativeGetOverlayablesToString(JNIEnv* env, jclass /*clazz*/, jlon
+   return env->NewStringUTF(result.c_str());
+ }
+ 
+-#ifdef __ANDROID__ // Layoutlib does not support parcel
++#if defined(__ANDROID__) || defined(__APPLE__)  // a2i: file descriptors work the same on Darwin // Layoutlib does not support parcel
+ static jobject ReturnParcelFileDescriptor(JNIEnv* env, std::unique_ptr<Asset> asset,
+                                           jlongArray out_offsets) {
+   off64_t start_offset, length;
+diff --git a/core/jni/core_jni_helpers.h b/core/jni/core_jni_helpers.h
+index 769fa723..0ca292a4 100644
+--- a/core/jni/core_jni_helpers.h
++++ b/core/jni/core_jni_helpers.h
+@@ -28,7 +28,9 @@
+ // and they need all the JNI methods to have JNIEnv* and jclass/jobject as their first two arguments.
+ // The following macro allows to have those arguments when compiling for host while omitting them when
+ // compiling for Android.
+-#ifdef __ANDROID__
++// (Or for any other build whose runtime is ART, which calls @CriticalNative methods the
++// same way wherever it runs.)
++#if defined(__ANDROID__) || defined(A2I_ART_CRITICAL_NATIVES)
+ #define CRITICAL_JNI_PARAMS
+ #define CRITICAL_JNI_PARAMS_COMMA
+ #else

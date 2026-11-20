@@ -1,0 +1,23 @@
+diff --git a/ojluni/src/main/native/LinuxNativeDispatcher.c b/ojluni/src/main/native/LinuxNativeDispatcher.c
+index c8500db..4c8174f 100644
+--- a/ojluni/src/main/native/LinuxNativeDispatcher.c
++++ b/ojluni/src/main/native/LinuxNativeDispatcher.c
+@@ -62,10 +62,18 @@ static void throwUnixException(JNIEnv* env, int errnum) {
+ JNIEXPORT void JNICALL
+ Java_sun_nio_fs_LinuxNativeDispatcher_init(JNIEnv *env, jclass clazz)
+ {
++#if defined(__APPLE__)
++    // Darwin's functions of these names take extra arguments; use the Linux-shaped ones.
++    my_fgetxattr_func = (fgetxattr_func*)a2i_linux_fgetxattr;
++    my_fsetxattr_func = (fsetxattr_func*)a2i_linux_fsetxattr;
++    my_fremovexattr_func = (fremovexattr_func*)a2i_linux_fremovexattr;
++    my_flistxattr_func = (flistxattr_func*)a2i_linux_flistxattr;
++#else
+     my_fgetxattr_func = (fgetxattr_func*)dlsym(RTLD_DEFAULT, "fgetxattr");
+     my_fsetxattr_func = (fsetxattr_func*)dlsym(RTLD_DEFAULT, "fsetxattr");
+     my_fremovexattr_func = (fremovexattr_func*)dlsym(RTLD_DEFAULT, "fremovexattr");
+     my_flistxattr_func = (flistxattr_func*)dlsym(RTLD_DEFAULT, "flistxattr");
++#endif
+ 
+     clazz = (*env)->FindClass(env, "sun/nio/fs/UnixMountEntry");
+     CHECK_NULL(clazz);

@@ -1,0 +1,15 @@
+diff --git a/icu4c/source/common/udata.cpp b/icu4c/source/common/udata.cpp
+index e5f65b3..235d865 100644
+--- a/icu4c/source/common/udata.cpp
++++ b/icu4c/source/common/udata.cpp
+@@ -129,6 +129,10 @@ static UDataFileAccess  gDataFileAccess = UDATA_NO_FILES;
+     #define AOSP_ICU_INIT 1
+   #endif
+ #endif
++#if U_PLATFORM_IS_DARWIN_BASED
++  // The Android runtime on Darwin takes its ICU data from the i18n module as well.
++  #define AOSP_ICU_INIT 1
++#endif
+ 
+ #ifdef AOSP_ICU_INIT
+   #include "androidicuinit/android_icu_init.h"

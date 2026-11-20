@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  packer:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --check
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+
+  scripts:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install shellcheck
+      - run: shellcheck scripts/*.sh scripts/dev/*.sh tests/*/run.sh
+      - name: Python syntax
+        run: |
+          python3 -c 'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
+            scripts/*.py runtime/aosp/tools/*.py runtime/bionic/*.py

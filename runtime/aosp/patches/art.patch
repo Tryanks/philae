@@ -1,0 +1,957 @@
+diff --git a/libartbase/base/globals.h b/libartbase/base/globals.h
+index cab7fab..e5f063e 100644
+--- a/libartbase/base/globals.h
++++ b/libartbase/base/globals.h
+@@ -124,6 +124,17 @@ static constexpr bool kHostStaticBuildEnabled = true;
+ static constexpr bool kHostStaticBuildEnabled = false;
+ #endif
+ 
++// ART stores heap references as 32 bits and therefore keeps the managed heap in what it
++// calls the "low 4GB". Darwin/arm64 refuses to map anything below 4GiB, so there the low
++// 4GB is the window [gLow4GBBase, gLow4GBBase + 4GiB) instead. The base is a multiple of
++// 4GiB: compressing a reference is still a truncation to 32 bits, and only decompression
++// has to add the base back (see mirror::PtrCompression). Chosen in MemMap::Init().
++#if defined(__APPLE__) && defined(__LP64__)
++extern uintptr_t gLow4GBBase;
++#else
++static constexpr uintptr_t gLow4GBBase = 0u;
++#endif
++
+ // Within libart, gPageSize should be used to get the page size value once Runtime is initialized.
+ // For most other cases MemMap::GetPageSize() should be used instead. However, where MemMap is
+ // unavailable e.g. during static initialization or another stage when MemMap isn't yet initialized,
+@@ -133,7 +144,7 @@ static constexpr bool kHostStaticBuildEnabled = false;
+ #ifdef ART_PAGE_SIZE_AGNOSTIC
+ inline ALWAYS_INLINE size_t GetPageSizeSlow() {
+   static_assert(kPageSizeAgnostic, "The dynamic version is only for page size agnostic build");
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+   static const size_t page_size = sysconf(_SC_PAGE_SIZE);
+ #else
+   static const size_t page_size = 4096;
+diff --git a/libartbase/base/mem_map.cc b/libartbase/base/mem_map.cc
+index 0ab47f2..ee8a3ac 100644
+--- a/libartbase/base/mem_map.cc
++++ b/libartbase/base/mem_map.cc
+@@ -151,6 +151,39 @@ static uintptr_t GenerateNextMemPos(size_t page_size) {
+ uintptr_t MemMap::next_mem_pos_;
+ #endif
+ 
++#if defined(__APPLE__) && defined(__LP64__)
++uintptr_t gLow4GBBase = 0u;
++
++// Pick the window that stands in for the low 4GB (see globals.h). The kernel is asked for
++// a hole large enough to contain a 4GiB-aligned 4GiB range and the hole is released again:
++// the linear-scan allocator below then maps into it on demand, probing for foreign
++// mappings exactly as it does for the real low 4GB elsewhere.
++static uintptr_t ChooseLow4GBBase() {
++  constexpr size_t kWindow = 4 * GB;
++  // The base must be a multiple of 4 GiB with free address space after it. Asking the
++  // kernel for an 8 GiB hole and aligning within it works on a Mac, but an iPhone process
++  // has too little address space for that. So candidate bases are probed directly, for
++  // the largest free run that can be had: the window is not reserved as a whole (later
++  // allocations look for free pages inside it), it only has to start out mostly free.
++  for (size_t probe : {2 * GB, GB, 512 * MB, 256 * MB}) {
++    for (uintptr_t base = kWindow; base < 256 * kWindow; base += kWindow) {
++      void* wanted = reinterpret_cast<void*>(base);
++      void* actual = mmap(wanted, probe, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
++      if (actual == MAP_FAILED) {
++        break;  // no run of this size anywhere
++      }
++      munmap(actual, probe);
++      if (actual == wanted) {
++        LOG(INFO) << "managed heap window at " << wanted << " (" << (probe / MB) << " MiB free at its start)";
++        return base;
++      }
++    }
++  }
++  LOG(FATAL) << "Cannot find address space for the managed heap window";
++  UNREACHABLE();
++}
++#endif
++
+ // Return true if the address range is contained in a single memory map by either reading
+ // the gMaps variable or the /proc/self/map entry.
+ bool MemMap::ContainedWithinExistingMap(uint8_t* ptr, size_t size, std::string* error_msg) {
+@@ -268,7 +301,8 @@ void* MemMap::TryMemMapLow4GB(void* ptr,
+   if (actual != MAP_FAILED) {
+     // Since we didn't use MAP_FIXED the kernel may have mapped it somewhere not in the low
+     // 4GB. If this is the case, unmap and retry.
+-    if (reinterpret_cast<uintptr_t>(actual) + page_aligned_byte_count >= 4 * GB) {
++    if (reinterpret_cast<uintptr_t>(actual) < gLow4GBBase ||
++        reinterpret_cast<uintptr_t>(actual) + page_aligned_byte_count >= gLow4GBBase + 4 * GB) {
+       TargetMUnmap(actual, page_aligned_byte_count);
+       actual = MAP_FAILED;
+     }
+@@ -1023,7 +1057,10 @@ void MemMap::Init() {
+ #if USE_ART_LOW_4G_ALLOCATOR
+   // Initialize linear scan to random position.
+   CHECK_EQ(next_mem_pos_, 0u);
+-  next_mem_pos_ = GenerateNextMemPos(GetPageSize());
++#if defined(__APPLE__) && defined(__LP64__)
++  gLow4GBBase = ChooseLow4GBBase();
++#endif
++  next_mem_pos_ = gLow4GBBase + GenerateNextMemPos(GetPageSize());
+ #endif
+   DCHECK(gMaps == nullptr);
+   gMaps = new Maps;
+@@ -1084,7 +1121,8 @@ void* MemMap::MapInternalArtLow4GBAllocator(size_t length,
+   bool first_run = true;
+ 
+   std::lock_guard<std::mutex> mu(*mem_maps_lock_);
+-  for (uintptr_t ptr = next_mem_pos_; ptr < 4 * GB; ptr += GetPageSize()) {
++  const uintptr_t low_4gb_end = gLow4GBBase + 4 * GB;
++  for (uintptr_t ptr = next_mem_pos_; ptr < low_4gb_end; ptr += GetPageSize()) {
+     // Use gMaps as an optimization to skip over large maps.
+     // Find the first map which is address > ptr.
+     auto it = gMaps->upper_bound(reinterpret_cast<void*>(ptr));
+@@ -1115,11 +1153,11 @@ void* MemMap::MapInternalArtLow4GBAllocator(size_t length,
+       return actual;
+     }
+ 
+-    if (4U * GB - ptr < length) {
++    if (low_4gb_end - ptr < length) {
+       // Not enough memory until 4GB.
+       if (first_run) {
+         // Try another time from the bottom;
+-        ptr = LOW_MEM_START - GetPageSize();
++        ptr = gLow4GBBase + LOW_MEM_START - GetPageSize();
+         first_run = false;
+         continue;
+       } else {
+@@ -1176,11 +1214,12 @@ void* MemMap::MapInternal(void* addr,
+ #ifdef __LP64__
+   // When requesting low_4g memory and having an expectation, the requested range should fit into
+   // 4GB.
+-  if (low_4gb && (
++  // (Relative to gLow4GBBase; a request below the base wraps around and is rejected too.)
++  if (low_4gb && addr != nullptr && (
+       // Start out of bounds.
+-      (reinterpret_cast<uintptr_t>(addr) >> 32) != 0 ||
++      ((reinterpret_cast<uintptr_t>(addr) - gLow4GBBase) >> 32) != 0 ||
+       // End out of bounds. For simplicity, this will fail for the last page of memory.
+-      ((reinterpret_cast<uintptr_t>(addr) + length) >> 32) != 0)) {
++      ((reinterpret_cast<uintptr_t>(addr) - gLow4GBBase + length) >> 32) != 0)) {
+     LOG(ERROR) << "The requested address space (" << addr << ", "
+                << reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + length)
+                << ") cannot fit in low_4gb";
+diff --git a/libartbase/base/time_utils.cc b/libartbase/base/time_utils.cc
+index b26e0ef..e10ee0a 100644
+--- a/libartbase/base/time_utils.cc
++++ b/libartbase/base/time_utils.cc
+@@ -153,7 +153,7 @@ std::string GetIsoDate() {
+ }
+ 
+ uint64_t MilliTime() {
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__APPLE__)
+   timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000) + now.tv_nsec / UINT64_C(1000000);
+@@ -165,7 +165,7 @@ uint64_t MilliTime() {
+ }
+ 
+ uint64_t MicroTime() {
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__APPLE__)
+   timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000) + now.tv_nsec / UINT64_C(1000);
+@@ -177,7 +177,7 @@ uint64_t MicroTime() {
+ }
+ 
+ uint64_t NanoTime() {
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__APPLE__)
+   timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000000) + now.tv_nsec;
+@@ -189,7 +189,7 @@ uint64_t NanoTime() {
+ }
+ 
+ uint64_t ThreadCpuNanoTime() {
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__APPLE__)
+   timespec now;
+   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+   return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000000) + now.tv_nsec;
+diff --git a/libartbase/base/utils.cc b/libartbase/base/utils.cc
+index 0ec262e..f573485 100644
+--- a/libartbase/base/utils.cc
++++ b/libartbase/base/utils.cc
+@@ -16,6 +16,10 @@
+ 
+ #include "utils.h"
+ 
++#if defined(__APPLE__)
++#include <libkern/OSCacheControl.h>
++#endif
++
+ #include <dirent.h>
+ #include <inttypes.h>
+ #include <pthread.h>
+@@ -158,7 +162,12 @@ bool FlushCpuCaches(void* begin, void* end) {
+ #else
+ 
+ bool FlushCpuCaches(void* begin, void* end) {
++#if defined(__APPLE__)
++  // The iOS SDK has no __clear_cache; this is Darwin's own interface for the same thing.
++  sys_icache_invalidate(begin, reinterpret_cast<char*>(end) - reinterpret_cast<char*>(begin));
++#else
+   __builtin___clear_cache(reinterpret_cast<char*>(begin), reinterpret_cast<char*>(end));
++#endif
+   return true;
+ }
+ 
+diff --git a/libnativeloader/native_loader.cpp b/libnativeloader/native_loader.cpp
+index 13a4c2a..2f3d7e8 100644
+--- a/libnativeloader/native_loader.cpp
++++ b/libnativeloader/native_loader.cpp
+@@ -473,6 +473,21 @@ void* OpenNativeLibrary(JNIEnv* env,
+       complete_path.append(path);
+       path_arg = complete_path.c_str();
+     }
++#if defined(__APPLE__)
++    // Android names its libraries lib*.so. This port ships them as Mach-O dylibs beside the
++    // runtime, where a bare name is found through the run path rather than a search path.
++    std::string darwin_path;
++    if (path_arg != nullptr) {
++      darwin_path = path_arg;
++      if (darwin_path.size() > 3 && darwin_path.compare(darwin_path.size() - 3, 3, ".so") == 0) {
++        darwin_path.replace(darwin_path.size() - 3, 3, ".dylib");
++      }
++      if (darwin_path.find('/') == std::string::npos) {
++        darwin_path.insert(0, "@rpath/");
++      }
++      path_arg = darwin_path.c_str();
++    }
++#endif
+     void* handle = dlopen(path_arg, RTLD_NOW);
+     if (handle != nullptr) {
+       return handle;
+diff --git a/runtime/arch/arm64/asm_support_arm64.S b/runtime/arch/arm64/asm_support_arm64.S
+index 25f84e7..d211ea3 100644
+--- a/runtime/arch/arm64/asm_support_arm64.S
++++ b/runtime/arch/arm64/asm_support_arm64.S
+@@ -81,8 +81,13 @@
+ .endm
+ 
+ .macro ENTRY_ALIGNED name, alignment
++#if defined(__APPLE__)
++    // Mach-O has no symbol types or sizes, and spells hidden visibility differently.
++    .private_extern \name
++#else
+     .type \name, #function
+     .hidden \name  // Hide this as a global symbol, so we do not incur plt calls.
++#endif
+     .global \name
+     .balign \alignment
+ \name:
+@@ -95,7 +100,9 @@
+ 
+ .macro END name
+     .cfi_endproc
++#if !defined(__APPLE__)
+     .size \name, .-\name
++#endif
+ .endm
+ 
+ .macro UNIMPLEMENTED name
+@@ -163,12 +170,17 @@
+ .endm
+ 
+ .macro LOAD_RUNTIME_INSTANCE reg
++#if defined(__APPLE__)
++    adrp \reg, _ZN3art7Runtime9instance_E@PAGE
++    ldr \reg, [\reg, _ZN3art7Runtime9instance_E@PAGEOFF]
++#else
+ #if __has_feature(hwaddress_sanitizer)
+     adrp \reg, :pg_hi21_nc:_ZN3art7Runtime9instance_E
+ #else
+     adrp \reg, _ZN3art7Runtime9instance_E
+ #endif
+     ldr \reg, [\reg, #:lo12:_ZN3art7Runtime9instance_E]
++#endif
+ .endm
+ 
+ // Macro to refresh the Marking Register (W20).
+diff --git a/runtime/arch/arm64/context_arm64.cc b/runtime/arch/arm64/context_arm64.cc
+index 96cd101..475ebac 100644
+--- a/runtime/arch/arm64/context_arm64.cc
++++ b/runtime/arch/arm64/context_arm64.cc
+@@ -33,7 +33,7 @@ extern "C" __attribute__((weak)) void __hwasan_handle_longjmp(const void* sp_dst
+ namespace art HIDDEN {
+ namespace arm64 {
+ 
+-static constexpr uint64_t gZero = 0;
++static constexpr uintptr_t gZero = 0;
+ 
+ void Arm64Context::Reset() {
+   std::fill_n(gprs_, arraysize(gprs_), nullptr);
+@@ -82,7 +82,7 @@ void Arm64Context::SetFPR(uint32_t reg, uintptr_t value) {
+ 
+ void Arm64Context::SmashCallerSaves() {
+   // This needs to be 0 because we want a null/zero return value.
+-  gprs_[X0] = const_cast<uint64_t*>(&gZero);
++  gprs_[X0] = const_cast<uintptr_t*>(&gZero);
+   gprs_[X1] = nullptr;
+   gprs_[X2] = nullptr;
+   gprs_[X3] = nullptr;
+diff --git a/runtime/arch/arm64/context_arm64.h b/runtime/arch/arm64/context_arm64.h
+index 0a284c9..d455762 100644
+--- a/runtime/arch/arm64/context_arm64.h
++++ b/runtime/arch/arm64/context_arm64.h
+@@ -95,7 +95,7 @@ class Arm64Context final : public Context {
+   // Pointers to register locations, initialized to null or the specific registers below. We need
+   // an additional one for the PC.
+   uintptr_t* gprs_[kNumberOfXRegisters + 1];
+-  uint64_t * fprs_[kNumberOfDRegisters];
++  uintptr_t* fprs_[kNumberOfDRegisters];
+   // Hold values for sp, pc and arg0 if they are not located within a stack frame.
+   uintptr_t sp_, pc_, arg0_;
+ };
+diff --git a/runtime/arch/arm64/quick_entrypoints_arm64.S b/runtime/arch/arm64/quick_entrypoints_arm64.S
+index 3c2445c..cea115f 100644
+--- a/runtime/arch/arm64/quick_entrypoints_arm64.S
++++ b/runtime/arch/arm64/quick_entrypoints_arm64.S
+@@ -2368,13 +2368,21 @@ ENTRY_ALIGNED art_quick_read_barrier_mark_introspection, 512
+     // array switch cases. Should we go a little bit over the limit, we can
+     // move some code after the array switch cases and return switch cases.
+     .balign 256
++#if defined(__APPLE__)
++    .private_extern art_quick_read_barrier_mark_introspection_arrays
++#else
+     .hidden art_quick_read_barrier_mark_introspection_arrays
++#endif
+     .global art_quick_read_barrier_mark_introspection_arrays
+ art_quick_read_barrier_mark_introspection_arrays:
+     FOR_XREGISTERS INTROSPECTION_ARRAY_LOAD, BRK0_BRK0
+ .Lmark_introspection_return_switch:
+     FOR_WREGISTERS MOV_WIP0_TO_WREG_AND_BL_LR, BRK0_BRK0
++#if defined(__APPLE__)
++    .private_extern art_quick_read_barrier_mark_introspection_gc_roots
++#else
+     .hidden art_quick_read_barrier_mark_introspection_gc_roots
++#endif
+     .global art_quick_read_barrier_mark_introspection_gc_roots
+ art_quick_read_barrier_mark_introspection_gc_roots:
+     READ_BARRIER_MARK_INTROSPECTION_SLOW_PATH BAKER_MARK_INTROSPECTION_GC_ROOT_LDR_OFFSET
+diff --git a/runtime/art_method-inl.h b/runtime/art_method-inl.h
+index d87040a..e9bb957 100644
+--- a/runtime/art_method-inl.h
++++ b/runtime/art_method-inl.h
+@@ -148,18 +148,13 @@ constexpr size_t NumberOfVRegs() {
+   return sum;
+ }
+ 
++// A single fold instead of a recursive overload pair: current clang rejects the recursion
++// as ambiguous between the variadic base case and the first-argument overload.
+ template <char... ArgType>
+ inline ALWAYS_INLINE void FillVRegs([[maybe_unused]] uint32_t* vregs,
+-                                    [[maybe_unused]] typename ShortyTraits<ArgType>::Type... args)
+-    REQUIRES_SHARED(Locks::mutator_lock_) {}
+-
+-template <char FirstArgType, char... ArgType>
+-inline ALWAYS_INLINE void FillVRegs(uint32_t* vregs,
+-                                    typename ShortyTraits<FirstArgType>::Type first_arg,
+                                     typename ShortyTraits<ArgType>::Type... args)
+     REQUIRES_SHARED(Locks::mutator_lock_) {
+-  ShortyTraits<FirstArgType>::Set(vregs, first_arg);
+-  FillVRegs<ArgType...>(vregs + ShortyTraits<FirstArgType>::kVRegCount, args...);
++  ((ShortyTraits<ArgType>::Set(vregs, args), vregs += ShortyTraits<ArgType>::kVRegCount), ...);
+ }
+ 
+ template <char... ArgType>
+diff --git a/runtime/base/mutex-inl.h b/runtime/base/mutex-inl.h
+index 6e572f0..f7c57b4 100644
+--- a/runtime/base/mutex-inl.h
++++ b/runtime/base/mutex-inl.h
+@@ -37,7 +37,11 @@ namespace art HIDDEN {
+ #if ART_USE_FUTEXES
+ static inline int futex(volatile int *uaddr, int op, int val, const struct timespec *timeout,
+                         volatile int *uaddr2, int val3) {
++#if defined(__APPLE__)
++  return a2i_futex(uaddr, op, val, timeout, uaddr2, val3);
++#else
+   return syscall(SYS_futex, uaddr, op, val, timeout, uaddr2, val3);
++#endif
+ }
+ #endif  // ART_USE_FUTEXES
+ 
+diff --git a/runtime/base/mutex.h b/runtime/base/mutex.h
+index e3d89e7..a06a622 100644
+--- a/runtime/base/mutex.h
++++ b/runtime/base/mutex.h
+@@ -33,7 +33,8 @@
+ #include "base/macros.h"
+ #include "locks.h"
+ 
+-#if defined(__linux__)
++// Darwin gets futexes from os_sync_wait_on_address; see art-ios/futex_darwin.cc.
++#if defined(__linux__) || defined(__APPLE__)
+ #define ART_USE_FUTEXES 1
+ #else
+ #define ART_USE_FUTEXES 0
+diff --git a/runtime/class_linker.cc b/runtime/class_linker.cc
+index c8394b2..7fe1160 100644
+--- a/runtime/class_linker.cc
++++ b/runtime/class_linker.cc
+@@ -16,6 +16,8 @@
+ 
+ #include "class_linker.h"
+ 
++#include <dlfcn.h>
++
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -451,10 +453,33 @@ ClassLinker::VisiblyInitializedCallback* ClassLinker::MarkClassInitialized(
+   }
+ }
+ 
++#if defined(__APPLE__)
++// Whether `code` is in AOSP's host build of the framework's native code (libandroid_runtime
++// as built for desktop JVMs), which this port uses in the simulator.
++static bool IsHostBuiltNativeCode(const void* code) {
++  Dl_info info;
++  if (dladdr(code, &info) == 0 || info.dli_fname == nullptr) {
++    return false;
++  }
++  const char* name = strrchr(info.dli_fname, '/');
++  name = (name != nullptr) ? name + 1 : info.dli_fname;
++  return strcmp(name, "libandroid_runtime.dylib") == 0;
++}
++#endif
++
+ const void* ClassLinker::RegisterNative(
+     Thread* self, ArtMethod* method, const void* native_method) {
+   CHECK(method->IsNative()) << method->PrettyMethod();
+   CHECK(native_method != nullptr) << method->PrettyMethod();
++#if defined(__APPLE__)
++  // @CriticalNative methods are implemented without the JNIEnv* and jclass arguments. The
++  // framework's native code as built for a desktop JVM, which has no such convention,
++  // gives them the regular JNI signature instead, so for natives registered from that
++  // build the annotation must be ignored.
++  if (method->IsCriticalNative() && IsHostBuiltNativeCode(native_method)) {
++    method->SetAccessFlags(method->GetAccessFlags() & ~kAccCriticalNative);
++  }
++#endif
+   void* new_native_method = nullptr;
+   Runtime* runtime = Runtime::Current();
+   runtime->GetRuntimeCallbacks()->RegisterNativeMethod(method,
+diff --git a/runtime/entrypoints/quick/quick_alloc_entrypoints.cc b/runtime/entrypoints/quick/quick_alloc_entrypoints.cc
+index 5b5527c..94c9ffb 100644
+--- a/runtime/entrypoints/quick/quick_alloc_entrypoints.cc
++++ b/runtime/entrypoints/quick/quick_alloc_entrypoints.cc
+@@ -194,7 +194,7 @@ void SetQuickAllocEntryPoints##suffix(QuickEntryPoints* qpoints, bool instrument
+ }
+ 
+ // Generate the entrypoint functions.
+-#if !defined(__APPLE__) || !defined(__LP64__)
++#if !defined(__APPLE__) || !defined(__LP64__) || defined(__aarch64__)
+ GENERATE_ENTRYPOINTS(_dlmalloc)
+ GENERATE_ENTRYPOINTS(_rosalloc)
+ GENERATE_ENTRYPOINTS(_bump_pointer)
+@@ -215,7 +215,7 @@ void SetQuickAllocEntryPointsInstrumented(bool instrumented) {
+ }
+ 
+ void ResetQuickAllocEntryPoints(QuickEntryPoints* qpoints) {
+-#if !defined(__APPLE__) || !defined(__LP64__)
++#if !defined(__APPLE__) || !defined(__LP64__) || defined(__aarch64__)
+   switch (entry_points_allocator) {
+     case gc::kAllocatorTypeDlMalloc: {
+       SetQuickAllocEntryPoints_dlmalloc(qpoints, entry_points_instrumented);
+diff --git a/runtime/entrypoints/quick/quick_trampoline_entrypoints.cc b/runtime/entrypoints/quick/quick_trampoline_entrypoints.cc
+index b53339a..aaff789 100644
+--- a/runtime/entrypoints/quick/quick_trampoline_entrypoints.cc
++++ b/runtime/entrypoints/quick/quick_trampoline_entrypoints.cc
+@@ -58,6 +58,11 @@
+ #include "var_handles.h"
+ #include "well_known_classes.h"
+ 
++#if defined(__APPLE__)
++#include "android_abi_jni.h"
++#include "jni/java_vm_ext.h"
++#endif
++
+ namespace art HIDDEN {
+ 
+ extern "C" NO_RETURN void artDeoptimizeFromCompiledCode(DeoptimizationKind kind, Thread* self);
+@@ -1444,7 +1449,7 @@ template<class T> class BuildNativeCallFrameStateMachine {
+       PushGpr(reinterpret_cast<uintptr_t>(val));
+     } else {
+       stack_entries_++;  // TODO: have a field for pointer length as multiple of 32b
+-      PushStack(reinterpret_cast<uintptr_t>(val));
++      PushStack(reinterpret_cast<uintptr_t>(val), sizeof(void*));
+       gpr_index_ = 0;
+     }
+   }
+@@ -1453,7 +1458,9 @@ template<class T> class BuildNativeCallFrameStateMachine {
+     return gpr_index_ > 0;
+   }
+ 
+-  void AdvanceInt(uint32_t val) {
++  // `size` is the argument's size in the native signature (1 for jboolean/jbyte, 2 for
++  // jchar/jshort, 4 for jint). It only matters where the native ABI packs stack arguments.
++  void AdvanceInt(uint32_t val, size_t size = sizeof(uint32_t)) {
+     if (HaveIntGpr()) {
+       gpr_index_--;
+       if (kMultiGPRegistersWidened) {
+@@ -1468,7 +1475,7 @@ template<class T> class BuildNativeCallFrameStateMachine {
+         DCHECK_EQ(sizeof(uintptr_t), sizeof(int64_t));
+         PushStack(static_cast<int64_t>(bit_cast<int32_t, uint32_t>(val)));
+       } else {
+-        PushStack(val);
++        PushStack(val, size);
+       }
+       gpr_index_ = 0;
+     }
+@@ -1546,7 +1553,7 @@ template<class T> class BuildNativeCallFrameStateMachine {
+       AdvanceInt(val);
+     } else {
+       stack_entries_++;
+-      PushStack(static_cast<uintptr_t>(val));
++      PushStack(static_cast<uintptr_t>(val), sizeof(float));
+       fpr_index_ = 0;
+     }
+   }
+@@ -1619,8 +1626,13 @@ template<class T> class BuildNativeCallFrameStateMachine {
+   void PushFpr8(uint64_t val) {
+     delegate_->PushFpr8(val);
+   }
+-  void PushStack(uintptr_t val) {
++  void PushStack(uintptr_t val, size_t size = sizeof(uintptr_t)) {
++#if defined(__APPLE__) && defined(__aarch64__)
++    delegate_->PushStackSized(val, size);
++#else
++    UNUSED(size);
+     delegate_->PushStack(val);
++#endif
+   }
+ 
+   uint32_t gpr_index_;      // Number of free GPRs
+@@ -1704,6 +1716,11 @@ class ComputeNativeCallFrameSize {
+     // not optimizing registers, yet
+   }
+ 
++  void PushStackSized(uintptr_t /* val */, size_t /* size */) {
++    // Counted by the state machine, one word per argument: an upper bound for the
++    // packed layout.
++  }
++
+   void PushStack(uintptr_t /* val */) {
+     // counting is already done in the superclass
+   }
+@@ -1785,7 +1802,8 @@ void ComputeGenericJniFrameSize::WalkHeader(
+ class FillNativeCall {
+  public:
+   FillNativeCall(uintptr_t* gpr_regs, uint32_t* fpr_regs, uintptr_t* stack_args) :
+-      cur_gpr_reg_(gpr_regs), cur_fpr_reg_(fpr_regs), cur_stack_arg_(stack_args) {}
++      cur_gpr_reg_(gpr_regs), cur_fpr_reg_(fpr_regs), cur_stack_arg_(stack_args),
++      cur_stack_byte_(reinterpret_cast<uint8_t*>(stack_args)) {}
+ 
+   virtual ~FillNativeCall() {}
+ 
+@@ -1793,6 +1811,7 @@ class FillNativeCall {
+     cur_gpr_reg_ = gpr_regs;
+     cur_fpr_reg_ = fpr_regs;
+     cur_stack_arg_ = stack_args;
++    cur_stack_byte_ = reinterpret_cast<uint8_t*>(stack_args);
+   }
+ 
+   void PushGpr(uintptr_t val) {
+@@ -1816,10 +1835,29 @@ class FillNativeCall {
+     cur_stack_arg_++;
+   }
+ 
++  // Apple's arm64 calling convention, unlike AAPCS64, does not give every stack argument
++  // an 8-byte slot: each one takes its own size at its own alignment.
++  void PushStackSized(uintptr_t val, size_t size) {
++    if (!packed_stack_args_) {
++      size = sizeof(uintptr_t);
++    }
++    cur_stack_byte_ = AlignUp(cur_stack_byte_, size);
++    memcpy(cur_stack_byte_, &val, size);  // little-endian: the low bytes
++    cur_stack_byte_ += size;
++  }
++
++  // a2i: native code built for Android expects AAPCS64's layout, one 8-byte slot per
++  // stack argument.
++  void SetPackedStackArgs(bool packed) {
++    packed_stack_args_ = packed;
++  }
++
+  private:
+   uintptr_t* cur_gpr_reg_;
+   uint32_t* cur_fpr_reg_;
+   uintptr_t* cur_stack_arg_;
++  uint8_t* cur_stack_byte_;
++  bool packed_stack_args_ = true;
+ };
+ 
+ // Visits arguments on the stack placing them into a region lower down the stack for the benefit
+@@ -1829,6 +1867,7 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
+   BuildGenericJniFrameVisitor(Thread* self,
+                               bool is_static,
+                               bool critical_native,
++                              bool android_abi,
+                               std::string_view shorty,
+                               ArtMethod** managed_sp,
+                               uintptr_t* reserved_area)
+@@ -1862,11 +1901,18 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
+     jni_call_.Reset(fsc.GetStartGprRegs(reserved_area),
+                     fsc.GetStartFprRegs(reserved_area),
+                     out_args_sp);
++    jni_call_.SetPackedStackArgs(!android_abi);
+ 
+     // First 2 parameters are always excluded for CriticalNative methods.
+     if (LIKELY(!critical_native)) {
+       // jni environment is always first argument
++#if defined(__APPLE__)
++      // a2i: code built for Android gets the JNIEnv made for it.
++      sm_.AdvancePointer(android_abi ? static_cast<void*>(AndroidAbiJniEnv(self->GetJniEnv()))
++                                     : static_cast<void*>(self->GetJniEnv()));
++#else
+       sm_.AdvancePointer(self->GetJniEnv());
++#endif
+ 
+       if (is_static) {
+         // The `jclass` is a pointer to the method's declaring class.
+@@ -1939,7 +1985,7 @@ void BuildGenericJniFrameVisitor::Visit() {
+     case Primitive::kPrimChar:     // Fall-through.
+     case Primitive::kPrimShort:    // Fall-through.
+     case Primitive::kPrimInt:      // Fall-through.
+-      sm_.AdvanceInt(*reinterpret_cast<jint*>(GetParamAddress()));
++      sm_.AdvanceInt(*reinterpret_cast<jint*>(GetParamAddress()), Primitive::ComponentSize(type));
+       current_vreg_ += 1u;
+       break;
+     case Primitive::kPrimVoid:
+@@ -1980,10 +2026,27 @@ extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
+   bool fast_native = called->IsFastNative();
+   bool normal_native = !critical_native && !fast_native;
+ 
++  // a2i: an app's own native libraries are Android binaries, and their functions take
++  // their arguments the Android way. Which kind this method's implementation is depends
++  // on where it is, so one that has not been looked up yet is looked up now. (The lookup
++  // stub the method still points to will find it again and then remember it.)
++  bool android_abi = false;
++#if defined(__APPLE__)
++  {
++    const void* code = called->GetEntryPointFromJni();
++    if (code == GetJniDlsymLookupStub() || code == GetJniDlsymLookupCriticalStub()) {
++      std::string error;
++      code = runtime->GetJavaVM()->FindCodeForNativeMethod(called, &error, /* can_suspend= */ false);
++    }
++    android_abi = IsAndroidAbiCode(code);
++  }
++#endif
++
+   // Run the visitor and update sp.
+   BuildGenericJniFrameVisitor visitor(self,
+                                       called->IsStatic(),
+                                       critical_native,
++                                      android_abi,
+                                       shorty,
+                                       managed_sp,
+                                       reserved_area);
+diff --git a/runtime/fault_handler.cc b/runtime/fault_handler.cc
+index 635de2a..0cef7dd 100644
+--- a/runtime/fault_handler.cc
++++ b/runtime/fault_handler.cc
+@@ -132,6 +132,9 @@ void FaultManager::Init(bool use_sig_chain) {
+ 
+     // Notify the kernel that we intend to use a specific `membarrier()` command.
+     int result = art::membarrier(MembarrierCommand::kRegisterPrivateExpedited);
++#if !defined(__linux__)
++    result = 0;  // membarrier() is Linux-only; its users (the JIT) are not active elsewhere.
++#endif
+     if (result != 0) {
+       LOG(WARNING) << "FaultHandler: MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED failed: "
+                    << errno << " " << strerror(errno);
+@@ -236,9 +239,11 @@ bool FaultManager::HandleSigbusFault(int sig, siginfo_t* info, [[maybe_unused]]
+   // Simulate a crash in a handler.
+   raise(SIGBUS);
+ #endif
++#if defined(__linux__)
+   if (Runtime::Current()->GetHeap()->MarkCompactCollector()->SigbusHandler(info)) {
+     return true;
+   }
++#endif
+ 
+   // Set a breakpoint in this function to catch unhandled signals.
+   art_sigbus_fault();
+diff --git a/runtime/gc/heap.cc b/runtime/gc/heap.cc
+index 07340bd..643d65f 100644
+--- a/runtime/gc/heap.cc
++++ b/runtime/gc/heap.cc
+@@ -442,6 +442,7 @@ Heap::Heap(size_t initial_size,
+     CHECK_EQ(foreground_collector_type_, kCollectorTypeCMC);
+     CHECK_EQ(background_collector_type_, kCollectorTypeCMCBackground);
+   } else {
++#if defined(__linux__)
+     // This ensures that userfaultfd syscall is done before any seccomp filter is installed.
+     // TODO(b/266731037): Remove this when we no longer need to collect metric on userfaultfd
+     // support.
+@@ -449,6 +450,7 @@ Heap::Heap(size_t initial_size,
+     // The check is just to ensure that compiler doesn't eliminate the function call above.
+     // Userfaultfd support is certain to be there if its minor-fault feature is supported.
+     CHECK_IMPLIES(minor_fault_supported, uffd_supported);
++#endif
+   }
+ 
+   if (gUseReadBarrier) {
+@@ -542,7 +544,7 @@ Heap::Heap(size_t initial_size,
+     if (foreground_collector_type_ == kCollectorTypeCC) {
+       // Need to use a low address so that we can allocate a contiguous 2 * Xmx space
+       // when there's no image (dex2oat for target).
+-      request_begin = kPreferredAllocSpaceBegin;
++      request_begin = kPreferredAllocSpaceBegin + gLow4GBBase;
+     }
+     // Gross hack to make dex2oat deterministic.
+     if (foreground_collector_type_ == kCollectorTypeMS && Runtime::Current()->IsAotCompiler()) {
+@@ -590,7 +592,7 @@ Heap::Heap(size_t initial_size,
+     CHECK(non_moving_space_mem_map.IsValid()) << error_str;
+     DCHECK(!heap_reservation.IsValid());
+     // Try to reserve virtual memory at a lower address if we have a separate non moving space.
+-    request_begin = kPreferredAllocSpaceBegin + non_moving_space_capacity;
++    request_begin = kPreferredAllocSpaceBegin + gLow4GBBase + non_moving_space_capacity;
+   }
+   // Attempt to create 2 mem maps at or after the requested begin.
+   if (foreground_collector_type_ != kCollectorTypeCC) {
+@@ -728,8 +730,9 @@ Heap::Heap(size_t initial_size,
+   // Start at 4 KB, we can be sure there are no spaces mapped this low since the address range is
+   // reserved by the kernel.
+   static constexpr size_t kMinHeapAddress = 4 * KB;
+-  card_table_.reset(accounting::CardTable::Create(reinterpret_cast<uint8_t*>(kMinHeapAddress),
+-                                                  4 * GB - kMinHeapAddress));
++  // (The low 4GB may be a window above 4GiB; see gLow4GBBase.)
++  card_table_.reset(accounting::CardTable::Create(
++      reinterpret_cast<uint8_t*>(gLow4GBBase + kMinHeapAddress), 4 * GB - kMinHeapAddress));
+   CHECK(card_table_.get() != nullptr) << "Failed to create card table";
+   if (foreground_collector_type_ == kCollectorTypeCC && kUseTableLookupReadBarrier) {
+     rb_table_.reset(new accounting::ReadBarrierTable());
+@@ -795,10 +798,12 @@ Heap::Heap(size_t initial_size,
+       semi_space_collector_ = new collector::SemiSpace(this);
+       garbage_collectors_.push_back(semi_space_collector_);
+     }
++#if defined(__linux__)
+     if (MayUseCollector(kCollectorTypeCMC)) {
+       mark_compact_ = new collector::MarkCompact(this);
+       garbage_collectors_.push_back(mark_compact_);
+     }
++#endif
+     if (MayUseCollector(kCollectorTypeCC)) {
+       concurrent_copying_collector_ = new collector::ConcurrentCopying(this,
+                                                                        /*young_gen=*/false,
+@@ -3895,7 +3900,9 @@ void Heap::ClampGrowthLimit() {
+     DCHECK(gUseUserfaultfd);
+     DCHECK_NE(mark_compact_, nullptr);
+     DCHECK_NE(bump_pointer_space_, nullptr);
++#if defined(__linux__)
+     mark_compact_->ClampGrowthLimit(capacity_);
++#endif
+   }
+   // This space isn't added for performance reasons.
+   if (main_space_backup_.get() != nullptr) {
+diff --git a/runtime/gc/space/space.cc b/runtime/gc/space/space.cc
+index 5fc09b8..5c67305 100644
+--- a/runtime/gc/space/space.cc
++++ b/runtime/gc/space/space.cc
+@@ -81,9 +81,11 @@ DiscontinuousSpace::DiscontinuousSpace(const std::string& name,
+     Space(name, gc_retention_policy) {
+   // TODO: Fix this if we ever support objects not in the low 32 bit.
+   const size_t capacity = static_cast<size_t>(std::numeric_limits<uint32_t>::max());
+-  live_bitmap_ = accounting::LargeObjectBitmap::Create("large live objects", nullptr, capacity);
++  // (The low 4GB may be a window above 4GiB; see gLow4GBBase.)
++  uint8_t* const begin = reinterpret_cast<uint8_t*>(gLow4GBBase);
++  live_bitmap_ = accounting::LargeObjectBitmap::Create("large live objects", begin, capacity);
+   CHECK(live_bitmap_.IsValid());
+-  mark_bitmap_ = accounting::LargeObjectBitmap::Create("large marked objects", nullptr, capacity);
++  mark_bitmap_ = accounting::LargeObjectBitmap::Create("large marked objects", begin, capacity);
+   CHECK(mark_bitmap_.IsValid());
+ }
+ 
+diff --git a/runtime/interpreter/mterp/nterp.cc b/runtime/interpreter/mterp/nterp.cc
+index b2591d8..478652d 100644
+--- a/runtime/interpreter/mterp/nterp.cc
++++ b/runtime/interpreter/mterp/nterp.cc
+@@ -35,6 +35,11 @@ namespace art HIDDEN {
+ namespace interpreter {
+ 
+ bool IsNterpSupported() {
++#if defined(__APPLE__)
++  // The assembly interpreter treats heap references as raw 32-bit addresses, which
++  // does not hold where the heap cannot be mapped below 4 GiB.
++  return false;
++#endif
+   switch (kRuntimeISA) {
+     case InstructionSet::kArm:
+     case InstructionSet::kThumb2:
+@@ -100,6 +105,9 @@ ArrayRef<const uint8_t> NterpWithClinitImpl() {
+  * Verify some constants used by the nterp interpreter.
+  */
+ void CheckNterpAsmConstants() {
++  if (!IsNterpSupported()) {
++    return;
++  }
+   /*
+    * If we're using computed goto instruction transitions, make sure
+    * none of the handlers overflows the byte limit.  This won't tell
+diff --git a/runtime/jni/java_vm_ext.cc b/runtime/jni/java_vm_ext.cc
+index 60b4369..a47b311 100644
+--- a/runtime/jni/java_vm_ext.cc
++++ b/runtime/jni/java_vm_ext.cc
+@@ -16,6 +16,10 @@
+ 
+ #include "java_vm_ext-inl.h"
+ 
++#if defined(__APPLE__)
++#include "android_abi_jni.h"
++#endif
++
+ #include <dlfcn.h>
+ #include <string_view>
+ 
+@@ -1114,7 +1118,12 @@ bool JavaVMExt::LoadNativeLibrary(JNIEnv* env,
+     VLOG(jni) << "[Calling JNI_OnLoad in \"" << path << "\"]";
+     using JNI_OnLoadFn = int(*)(JavaVM*, void*);
+     JNI_OnLoadFn jni_on_load = reinterpret_cast<JNI_OnLoadFn>(sym);
++#if defined(__APPLE__)
++    // a2i: a library built for Android gets the JavaVM made for such code.
++    int version = (*jni_on_load)(IsAndroidAbiCode(sym) ? AndroidAbiJavaVm(this) : this, nullptr);
++#else
+     int version = (*jni_on_load)(this, nullptr);
++#endif
+ 
+     if (IsSdkVersionSetAndAtMost(runtime_->GetTargetSdkVersion(), SdkVersion::kL)) {
+       // Make sure that sigchain owns SIGSEGV.
+diff --git a/runtime/jni/jni_internal.cc b/runtime/jni/jni_internal.cc
+index 6906996..f6887fd 100644
+--- a/runtime/jni/jni_internal.cc
++++ b/runtime/jni/jni_internal.cc
+@@ -528,6 +528,15 @@ ArtField* FindFieldJNI(const ScopedObjectAccess& soa,
+   if (c == nullptr) {
+     return nullptr;
+   }
++#if defined(__APPLE__)
++  // a2i: native code built for a desktop JVM (the prebuilt host build of the framework's
++  // graphics library is) reads the descriptor of a java.io.FileDescriptor from its field
++  // "fd", the OpenJDK name. In libcore the same field is called "descriptor".
++  if (!is_static && strcmp(name, "fd") == 0 && strcmp(sig, "I") == 0 &&
++      c->DescriptorEquals("Ljava/io/FileDescriptor;")) {
++    name = "descriptor";
++  }
++#endif
+   ArtField* field = nullptr;
+   ObjPtr<mirror::Class> field_type;
+   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+diff --git a/runtime/mirror/object_reference.h b/runtime/mirror/object_reference.h
+index 177b968..0e16227 100644
+--- a/runtime/mirror/object_reference.h
++++ b/runtime/mirror/object_reference.h
+@@ -97,13 +97,20 @@ class PtrCompression {
+  public:
+   // Compress reference to its bit representation.
+   static uint32_t Compress(MirrorType* mirror_ptr) {
+-    uint32_t as_bits = reinterpret_cast32<uint32_t>(mirror_ptr);
++    // The heap lies in [gLow4GBBase, gLow4GBBase + 4GiB) and the base is a multiple of
++    // 4GiB, so the low 32 bits identify the object (and null stays 0).
++    uint32_t as_bits = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mirror_ptr));
++    DCHECK(mirror_ptr == nullptr ||
++           (reinterpret_cast<uintptr_t>(mirror_ptr) >> 32) == (gLow4GBBase >> 32));
+     return kPoisonReferences ? -as_bits : as_bits;
+   }
+ 
+   // Uncompress an encoded reference from its bit representation.
+   static MirrorType* Decompress(uint32_t ref) {
+     uint32_t as_bits = kPoisonReferences ? -ref : ref;
++    if (gLow4GBBase != 0u && as_bits != 0u) {
++      return reinterpret_cast<MirrorType*>(gLow4GBBase | as_bits);
++    }
+     return reinterpret_cast32<MirrorType*>(as_bits);
+   }
+ 
+diff --git a/runtime/monitor.cc b/runtime/monitor.cc
+index e03b470..e3c0a00 100644
+--- a/runtime/monitor.cc
++++ b/runtime/monitor.cc
+@@ -1529,7 +1529,8 @@ void Monitor::VisitLocks(StackVisitor* stack_visitor,
+       // not be optimized out.
+       success = stack_visitor->GetVReg(m, dex_reg, kReferenceVReg, &value);
+       if (success) {
+-        mirror::Object* mp = reinterpret_cast<mirror::Object*>(value);
++        mirror::Object* mp =
++            mirror::CompressedReference<mirror::Object>::FromVRegValue(value).AsMirrorPtr();
+         // TODO(b/299577730) Remove the extra checks here once the underlying bug is fixed.
+         const gc::Verification* v = Runtime::Current()->GetHeap()->GetVerification();
+         if (v->IsValidObject(mp)) {
+diff --git a/runtime/runtime.cc b/runtime/runtime.cc
+index 1521809..a0696f7 100644
+--- a/runtime/runtime.cc
++++ b/runtime/runtime.cc
+@@ -1561,7 +1561,9 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
+   //       is out-of-the-way enough that it should not collide with boot image mapping.
+   // Note: Don't request an error message. That will lead to a maps dump in the case of failure,
+   //       leading to logspam.
+-  {
++  // (Where the low 4GB is a window above 4GiB, the real low 4GB is unmappable and the
++  // sentinel address therefore faults without any reservation.)
++  if (gLow4GBBase == 0u) {
+     const uintptr_t sentinel_addr =
+         RoundDown(static_cast<uintptr_t>(Context::kBadGprBase), gPageSize);
+     protected_fault_page_ = MemMap::MapAnonymous("Sentinel fault page",
+@@ -1873,7 +1875,13 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
+   InitPlatformSignalHandlers();
+ 
+   // Change the implicit checks flags based on runtime architecture.
++#if defined(__APPLE__)
++  // Implicit checks turn SIGSEGVs raised by compiled code into Java behaviour. This port
++  // only interprets, and the interpreter checks explicitly, so keep them all disabled.
++  switch (InstructionSet::kNone) {
++#else
+   switch (kRuntimeISA) {
++#endif
+     case InstructionSet::kArm64:
+       implicit_suspend_checks_ = true;
+       FALLTHROUGH_INTENDED;
+diff --git a/runtime/signal_set.h b/runtime/signal_set.h
+index 470319c..13b7566 100644
+--- a/runtime/signal_set.h
++++ b/runtime/signal_set.h
+@@ -23,7 +23,7 @@
+ 
+ #include "base/macros.h"
+ 
+-#if defined(__GLIBC__) || defined(ANDROID_HOST_MUSL)
++#if defined(__GLIBC__) || defined(ANDROID_HOST_MUSL) || defined(__APPLE__)
+ #define sigset64_t sigset_t
+ #define sigemptyset64 sigemptyset
+ #define sigaddset64 sigaddset
+diff --git a/runtime/stack.cc b/runtime/stack.cc
+index bcc1da7..161c020 100644
+--- a/runtime/stack.cc
++++ b/runtime/stack.cc
+@@ -200,7 +200,7 @@ ObjPtr<mirror::Object> StackVisitor::GetThisObject() const {
+       if (!GetVReg(m, reg, kReferenceVReg, &value)) {
+         return nullptr;
+       }
+-      return reinterpret_cast<mirror::Object*>(value);
++      return mirror::CompressedReference<mirror::Object>::FromVRegValue(value).AsMirrorPtr();
+     }
+   }
+ }
+@@ -268,10 +268,10 @@ bool StackVisitor::GetVReg(ArtMethod* m,
+     }
+     if (kind == kReferenceVReg) {
+       // Perform a read barrier in case we are in a different thread and GC is ongoing.
+-      mirror::Object* out = reinterpret_cast<mirror::Object*>(static_cast<uintptr_t>(*val));
+-      uintptr_t ptr_out = reinterpret_cast<uintptr_t>(GcRoot<mirror::Object>(out).Read());
+-      DCHECK_LT(ptr_out, std::numeric_limits<uint32_t>::max());
+-      *val = static_cast<uint32_t>(ptr_out);
++      mirror::Object* out =
++          mirror::CompressedReference<mirror::Object>::FromVRegValue(*val).AsMirrorPtr();
++      *val = mirror::CompressedReference<mirror::Object>::FromMirrorPtr(
++          GcRoot<mirror::Object>(out).Read()).AsVRegValue();
+     }
+     return result;
+   } else {

@@ -1,0 +1,61 @@
+# C library functions whose Android and iOS versions agree in calling convention, data
+# layouts and constants. The bionic library forwards each one unchanged
+# (bionic_<name> jumps to <name>). One name per line; "a=b" forwards a to b.
+
+# memory and strings
+memchr memcmp memcpy memmove memset memmem
+strcasecmp strncasecmp strcat strncat strchr strcmp strcpy strcspn strdup strndup strlen strncmp strncpy
+strnlen strrchr strspn strstr strtok strtok_r strpbrk strsep strlcpy strlcat strcoll strxfrm strsignal
+strtod strtof strtoimax strtol strtoll strtoul strtoull strtoumax atof atoi atol atoll
+malloc calloc realloc free posix_memalign valloc
+bsearch qsort rand srand random srandom rand_r drand48 lrand48 srand48 abs labs llabs div ldiv lldiv
+getenv setenv unsetenv putenv abort exit _exit atexit arc4random arc4random_buf arc4random_uniform
+realpath mkstemp mkdtemp basename dirname
+setjmp longjmp _setjmp _longjmp sigsetjmp siglongjmp
+__cxa_atexit __cxa_finalize
+mkstemp64=mkstemp
+
+# character classes
+isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit
+tolower toupper isascii toascii
+iswalnum iswalpha iswblank iswcntrl iswdigit iswgraph iswlower iswprint iswpunct iswspace iswupper iswxdigit
+towlower towupper wctype iswctype
+iswalnum_l iswalpha_l iswblank_l iswcntrl_l iswdigit_l iswgraph_l iswlower_l iswprint_l iswpunct_l iswspace_l
+iswupper_l iswxdigit_l towlower_l towupper_l
+isalnum_l isalpha_l isdigit_l islower_l isupper_l isxdigit_l isspace_l isprint_l tolower_l toupper_l
+
+# wide strings (wchar_t is 32 bits on both)
+wcschr wcsrchr wcslen wcscmp wcsncmp wcscpy wcsncpy wcscat wcsstr wmemchr wmemcmp wmemcpy wmemmove wmemset
+wcstod wcstof wcstol wcstoll wcstoul wcstoull wcscoll wcsxfrm btowc wctob
+strcoll_l strxfrm_l wcscoll_l wcsxfrm_l strtoll_l strtoull_l strtod_l strtof_l strftime_l
+freelocale uselocale localeconv
+
+# math
+acos acosf acosh asin asinf asinh atan atanf atan2 atan2f atanh cbrt cbrtf ceil ceilf copysign copysignf
+cos cosf cosh coshf erf erfc exp expf exp2 exp2f expm1 expm1f fabs fabsf fdim floor floorf fma fmaf fmax
+fmaxf fmin fminf fmod fmodf frexp frexpf hypot hypotf ilogb ldexp ldexpf lgamma llrint llrintf llround
+llroundf log logf log10 log10f log1p log1pf log2 log2f logb lrint lrintf lround lroundf modf modff nan
+nearbyint nearbyintf nextafter pow powf remainder remquo rint rintf round roundf scalbn scalbnf sin sinf
+sinh sinhf sqrt sqrtf tan tanf tanh tanhf tgamma trunc truncf
+fesetround fegetround feclearexcept fetestexcept feraiseexcept fegetenv fesetenv feholdexcept feupdateenv
+
+# time (struct tm, time_t and struct timespec agree)
+time gmtime gmtime_r localtime localtime_r mktime timegm strftime strptime ctime ctime_r asctime asctime_r
+tzset nanosleep sleep usleep difftime clock
+
+# files and processes, as far as only file descriptors, strings and matching constants are involved
+access close dup dup2 fsync fdatasync=fsync ftruncate ftruncate64=ftruncate getcwd chdir
+getegid geteuid getgid getpid getppid getuid pipe read write pread pwrite pread64=pread pwrite64=pwrite
+readlink rmdir unlink lseek lseek64=lseek fchmod fchown chmod chown link symlink mkdir rename remove
+sched_yield getpagesize flock truncate isatty umask sync
+readv writev poll
+opendir closedir rewinddir dirfd
+
+# zlib (libz.so)
+adler32 crc32 compress compress2 compressBound uncompress deflate deflateEnd deflateInit_ deflateInit2_
+deflateReset deflateBound deflateParams deflateSetDictionary inflate inflateEnd inflateInit_ inflateInit2_
+inflateReset inflateReset2 inflateSetDictionary inflateSync zlibVersion zError
+gzopen gzdopen gzread gzwrite gzclose gzgets gzputs gzeof gzerror gzseek gztell gzflush
+
+# dynamic loading, apart from the special handles
+dlclose dlerror dladdr

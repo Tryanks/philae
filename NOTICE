@@ -1,0 +1,43 @@
+Philae
+Copyright (c) 2026 Tryanks
+
+This project's own code is licensed under the MIT License (see LICENSE), with the
+exception below.
+
+Patches to the Android Open Source Project
+------------------------------------------
+The files in runtime/aosp/patches/ are modifications to source code of the Android Open
+Source Project (art, libcore, frameworks/base and external/icu, at the tag named in
+scripts/fetch-aosp.sh). They are derivative works of that code and are provided under the
+licenses of the files they modify: the Apache License, Version 2.0, for art and
+frameworks/base; the licenses stated in each file for libcore (Apache-2.0, and GPL-2.0 with
+the Classpath exception for the parts that come from OpenJDK) and for ICU (the Unicode
+License).
+
+Software that is downloaded, not included
+-----------------------------------------
+This repository contains no third-party code or binaries. The build scripts download the
+following to the machine they run on, each under its own license:
+
+  Android Open Source Project sources      android.googlesource.com   Apache-2.0 and others
+    art, libcore, libbase, liblog, libziparchive, libnativehelper, frameworks/base (parts),
+    frameworks/native (headers), bionic (headers), and the external projects icu,
+    boringssl, conscrypt, expat, fdlibm, dlmalloc, musl, lz4, lzma, fmtlib, tinyxml2,
+    cpu_features
+  Android 15 emulator system image         dl.google.com              Android SDK terms
+    used for the boot class path jars, ICU data, time zone data and root certificates
+  Robolectric android-all and              Maven Central              Apache-2.0 / MIT
+    nativeruntime-dist-compat                                         (fonts: OFL, Apache-2.0)
+    the Android framework classes and resources, AOSP's host build of the framework's
+    native graphics code, and system fonts
+  R8/D8                                    Google Maven               Apache-2.0
+
+An IPA produced by this tool contains code built from those components together with the
+Android app that was converted. Whoever distributes such an IPA is responsible for
+complying with the licenses of everything inside it, including the app's own.
+
+Trademarks
+----------
+Android is a trademark of Google LLC. iOS, iPhone and Xcode are trademarks of Apple Inc.
+(IOS is a trademark of Cisco, used by Apple under license). This project is not affiliated
+with, sponsored by or endorsed by Google or Apple.
